@@ -1,0 +1,135 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Sync Watchlist branch with Seerr releases
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-watchlist-release
+  cancel-in-progress: false
+
+env:
+  FEATURE_BRANCH: codex/local-watchlist
+  UPSTREAM_REPOSITORY: seerr-team/seerr
+
+jobs:
+  sync:
+    name: Sync and validate Watchlist branch
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout fork default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git remotes
+        shell: bash
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Find the latest stable Seerr release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          latest_tag="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          if [[ -z "$latest_tag" ]]; then
+            echo 'Could not determine the latest upstream release.' >&2
+            exit 1
+          fi
+          echo "Latest stable upstream release: $latest_tag"
+          echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Merge release into Watchlist branch
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_tag='${{ steps.release.outputs.tag }}'
+
+          git fetch upstream "refs/tags/${latest_tag}:refs/tags/${latest_tag}"
+          git fetch origin "${FEATURE_BRANCH}"
+          git switch --detach "origin/${FEATURE_BRANCH}"
+
+          if git merge-base --is-ancestor "$latest_tag" HEAD; then
+            echo "${FEATURE_BRANCH} already contains ${latest_tag}."
+            echo 'updated=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Merging ${latest_tag} into ${FEATURE_BRANCH}."
+          if ! git merge --no-edit --no-ff "$latest_tag" \
+            -m "chore: sync Watchlist with Seerr ${latest_tag}"; then
+            git merge --abort || true
+            echo 'The upstream release conflicts with the Watchlist branch.' >&2
+            echo 'Resolve the conflict manually, then rerun this workflow.' >&2
+            exit 1
+          fi
+
+          echo 'updated=true' >> "$GITHUB_OUTPUT"
+
+      - name: Set up pnpm
+        if: steps.merge.outputs.updated == 'true'
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+      - name: Set up Node.js
+        if: steps.merge.outputs.updated == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: package.json
+
+      - name: Get pnpm store directory
+        if: steps.merge.outputs.updated == 'true'
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+
+      - name: Cache pnpm store
+        if: steps.merge.outputs.updated == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        if: steps.merge.outputs.updated == 'true'
+        env:
+          CI: true
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        if: steps.merge.outputs.updated == 'true'
+        run: pnpm typecheck
+
+      - name: Run tests
+        if: steps.merge.outputs.updated == 'true'
+        env:
+          CI: true
+        run: pnpm test
+
+      - name: Lint
+        if: steps.merge.outputs.updated == 'true'
+        run: pnpm lint
+
+      - name: Check formatting
+        if: steps.merge.outputs.updated == 'true'
+        run: pnpm format:check
+
+      - name: Build production targets
+        if: steps.merge.outputs.updated == 'true'
+        run: pnpm build
+
+      - name: Push validated branch update
+        if: steps.merge.outputs.updated == 'true'
+        shell: bash
+        run: git push origin "HEAD:${FEATURE_BRANCH}"
