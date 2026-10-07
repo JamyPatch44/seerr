@@ -8,8 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-watchlist-release
@@ -24,10 +23,21 @@ jobs:
     name: Sync and validate Watchlist branch
     runs-on: ubuntu-24.04
     steps:
+      - name: Check sync token secret
+        env:
+          WATCHLIST_SYNC_TOKEN: ${{ secrets.WATCHLIST_SYNC_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "$WATCHLIST_SYNC_TOKEN" ]]; then
+            echo '::error::Add the WATCHLIST_SYNC_TOKEN repository secret before running this workflow.'
+            exit 1
+          fi
+
       - name: Checkout fork default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          token: ${{ secrets.WATCHLIST_SYNC_TOKEN }}
 
       - name: Configure Git remotes
         shell: bash
@@ -134,9 +144,3 @@ jobs:
         if: steps.merge.outputs.updated == 'true'
         shell: bash
         run: git push origin "HEAD:${FEATURE_BRANCH}"
-
-      - name: Trigger Watchlist Docker image build
-        if: steps.merge.outputs.updated == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run 'Publish Watchlist image' --repo "$GITHUB_REPOSITORY" --ref "$FEATURE_BRANCH"
